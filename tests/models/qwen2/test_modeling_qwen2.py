@@ -572,7 +572,7 @@ class Qwen2IntegrationTest(unittest.TestCase):
 
         qwen_model = "Qwen/Qwen2-0.5B"
 
-        tokenizer = AutoTokenizer.from_pretrained(qwen_model, pad_token="</s>", padding_side="right")
+        tokenizer = AutoTokenizer.from_pretrained(qwen_model, pad_token="</s>", padding_side="right", attn_implementation="executorch_custom_sdpa")
         EXPECTED_TEXT_COMPLETION = [
             "My favourite condiment is 100% natural, organic, gluten free, vegan, and free from preservatives. I"
         ]
@@ -613,6 +613,15 @@ class Qwen2IntegrationTest(unittest.TestCase):
             exported_program=exported_program, prompt_token_ids=prompt_token_ids, max_new_tokens=max_new_tokens
         )
         ep_generated_text = tokenizer.batch_decode(ep_generated_ids, skip_special_tokens=True)
+
+        # Check if the exported program contains the expected operator
+        self.assertTrue(
+            any(
+                "custom_sdpa" in op.target.name
+                for op in exported_program.graph.nodes
+                if op.op == "call_function"
+            )
+        )
         self.assertEqual(EXPECTED_TEXT_COMPLETION, ep_generated_text)
 
     @require_flash_attn
