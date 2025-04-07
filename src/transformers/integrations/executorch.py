@@ -14,7 +14,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from src.transformers.modeling_utils import AttentionInterface
+from transformers.modeling_utils import AttentionInterface
 
 from transformers.generation.configuration_utils import GenerationConfig
 
@@ -45,7 +45,7 @@ def custom_sdpa_with_start_pos_forward(
     **kwargs,
 ) -> Tuple[torch.Tensor, None]:
     # This is before the transpose
-    seq_len = query.shape[2]
+    max_seq_len = key.shape[2]
 
     # FA2 uses non-transposed inputs
     query = query.transpose(1, 2)
@@ -63,28 +63,27 @@ def custom_sdpa_with_start_pos_forward(
 
     # Calculate the input pos from attention mask.
     # Branch out for float vs bool mask
-    assert attention_mask.dim() == 2, "attention_mask must be a 2D matrix."
-
-    first_row_mask = attention_mask[0]
-
-    start_pos = torch.argmin(first_row_mask).item()
-
+    # assert attention_mask.dim() == 2, f"attention_mask must be a 2D matrix."
+    attention_mask = attention_mask.reshape(-1, max_seq_len)
+    first_row_mask = attention_mask[0, :]
+    # [0, 0, 0, 0, -inf, -inf, -inf, -inf], start_pos = 3
+    start_pos = torch.argmin(first_row_mask).item() - 1
     output = torch.ops.llama.custom_sdpa(
         query,
         key,
         value,
         start_pos=start_pos,
-        attention_mask=attention_mask,
-        dropout_p=0.0,
+        attn_mask=None,
+        drpout_p=0.0,
         is_causal=module.is_causal,
+        scale=scaling,
     )
-    return output.transpose(1, 2).to(input_dtype).contiguous(), None
+    return output.to(input_dtype), None
 
 
 AttentionInterface.register(
     "executorch_custom_sdpa", custom_sdpa_with_start_pos_forward
 )
-
 
 class TorchExportableModuleWithStaticCache(torch.nn.Module):
     """
@@ -276,6 +275,7 @@ def convert_and_export_with_cache(
                 TorchExportableModuleWithStaticCache(model),
                 args=(example_input_ids,),
                 kwargs={"cache_position": example_cache_position},
+                dynamic_shapes={"input_ids": {0: torch.export.Dim.AUTO}, "cache_position": None},
                 strict=True,
             )
         else:
