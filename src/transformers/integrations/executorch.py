@@ -10,7 +10,11 @@
 # an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 # specific language governing permissions and limitations under the License.
 
+
+from typing import Optional, Tuple, Union
+
 import torch
+from transformers.modeling_utils import AttentionInterface
 
 from transformers.generation.configuration_utils import GenerationConfig
 
@@ -19,8 +23,67 @@ from ..utils.import_utils import is_torch_available
 
 if is_torch_available():
     from transformers import PreTrainedModel, StaticCache
-    from transformers.pytorch_utils import is_torch_greater_or_equal, is_torch_greater_or_equal_than_2_3
+    from transformers.pytorch_utils import (
+        is_torch_greater_or_equal,
+        is_torch_greater_or_equal_than_2_3,
+    )
 
+from executorch.extension.llm.custom_ops.custom_ops import custom_sdpa
+
+# Register custom sdpa
+
+
+def custom_sdpa_with_start_pos_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Union[torch.Tensor, "BlockMask"],
+    scaling: Optional[float] = None,
+    softcap: Optional[float] = None,
+    head_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, None]:
+    # This is before the transpose
+    max_seq_len = key.shape[2]
+
+    # FA2 uses non-transposed inputs
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+
+    # Convert the hell out of the inputs to fp32 and back
+    input_dtype = query.dtype
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+
+    # Ignore the causal flag from kwargs but use the one in module
+    kwargs.pop("is_causal", None)
+
+    # Calculate the input pos from attention mask.
+    # Branch out for float vs bool mask
+    # assert attention_mask.dim() == 2, f"attention_mask must be a 2D matrix."
+    attention_mask = attention_mask.reshape(-1, max_seq_len)
+    first_row_mask = attention_mask[0, :]
+    # [0, 0, 0, 0, -inf, -inf, -inf, -inf], start_pos = 3
+    start_pos = torch.argmin(first_row_mask).item() - 1
+    output = torch.ops.llama.custom_sdpa(
+        query,
+        key,
+        value,
+        start_pos=start_pos,
+        attn_mask=None,
+        drpout_p=0.0,
+        is_causal=module.is_causal,
+        scale=scaling,
+    )
+    return output.to(input_dtype), None
+
+
+AttentionInterface.register(
+    "executorch_custom_sdpa", custom_sdpa_with_start_pos_forward
+)
 
 class TorchExportableModuleWithStaticCache(torch.nn.Module):
     """
@@ -69,7 +132,7 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         self.model = model
         self.static_cache = StaticCache(
             config=self.model.config,
-            batch_size=self.model.generation_config.cache_config.batch_size,
+            max_batch_size=self.model.generation_config.cache_config.batch_size,
             max_cache_len=self.model.generation_config.cache_config.max_cache_len,
             device=self.model.generation_config.cache_config.device,
             dtype=self.model.dtype,
@@ -212,6 +275,7 @@ def convert_and_export_with_cache(
                 TorchExportableModuleWithStaticCache(model),
                 args=(example_input_ids,),
                 kwargs={"cache_position": example_cache_position},
+                dynamic_shapes={"input_ids": {0: torch.export.Dim.AUTO}, "cache_position": None},
                 strict=True,
             )
         else:
